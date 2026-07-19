@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import math
 import struct
 import sys
@@ -19,29 +20,86 @@ from PIL import Image, ImageTk
 from playsound import playsound
 
 
-VERSION = "1.3.0"
-BASE_DIR = (
+SCRIPT_DIR = Path(__file__).resolve().parent
+EXECUTABLE_DIR = Path(sys.executable).resolve().parent
+BUNDLE_DIR = (
     Path(sys._MEIPASS)  # type: ignore[attr-defined]
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
-    else Path(__file__).resolve().parent
+    else SCRIPT_DIR
 )
-IMAGE_PATH = BASE_DIR / "horloge.png"
-BOB_IMAGE_PATH = BASE_DIR / "balancier.png"
+
+# Le fichier .ini reste prioritairement à côté du script ou de l'exécutable.
+BASE_DIR = EXECUTABLE_DIR if getattr(sys, "frozen", False) else SCRIPT_DIR
+
+
+def find_asset(filename: str) -> Path:
+    """Cherche une ressource dans les emplacements possibles de DTLclock."""
+    candidates = (
+        BASE_DIR / filename,
+        SCRIPT_DIR / filename,
+        BUNDLE_DIR / filename,
+        Path.cwd() / filename,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+IMAGE_PATH = find_asset("horloge.png")
+BOB_IMAGE_PATH = find_asset("balancier.png")
 BELLS = {
-    "1700": BASE_DIR / "bell1700.wav",
-    "1800": BASE_DIR / "bell1800.wav",
+    "1700": find_asset("bell1700.wav"),
+    "1800": find_asset("bell1800.wav"),
 }
-TICK_WAV_PATH = BASE_DIR / "tick.wav"
-TOCK_WAV_PATH = BASE_DIR / "tock.wav"
+TICK_WAV_PATH = find_asset("tick.wav")
+TOCK_WAV_PATH = find_asset("tock.wav")
+
+# Constantes de paramétrage chargées depuis DTLclock.ini, à côté du script.
+# Si le fichier est absent ou qu'une clé y manque, on retombe silencieusement
+# sur la valeur d'origine du code : le programme démarre quand même.
+CONFIG_PATH = BASE_DIR / "DTLclock.ini"
+_config = configparser.ConfigParser()
+_config.read(CONFIG_PATH, encoding="utf-8")
+
+
+def _cfg_str(section: str, key: str, fallback: str) -> str:
+    return _config.get(section, key, fallback=fallback)
+
+
+def _cfg_int(section: str, key: str, fallback: int) -> int:
+    try:
+        return _config.getint(section, key, fallback=fallback)
+    except ValueError:
+        return fallback
+
+
+def _cfg_float(section: str, key: str, fallback: float) -> float:
+    try:
+        return _config.getfloat(section, key, fallback=fallback)
+    except ValueError:
+        return fallback
+
+
+def _cfg_float_tuple(section: str, key: str, fallback: tuple[float, ...]) -> tuple[float, ...]:
+    raw = _config.get(section, key, fallback=None)
+    if raw is None:
+        return fallback
+    try:
+        return tuple(float(part.strip()) for part in raw.split(","))
+    except ValueError:
+        return fallback
+
+
+VERSION = _cfg_str("general", "VERSION", "1.6.0")
 
 root = tk.Tk()
 root.title(f"DTLclock v{VERSION}")
-root.geometry("500x900")
 root.minsize(420, 760)
 root.resizable(True, True)
 
-BACKGROUND_COLOR = "#efe4b0"
-TEXT_COLOR = "#17130c"
+BACKGROUND_COLOR = _cfg_str("couleurs", "BACKGROUND_COLOR", "#efe4b0")
+TEXT_COLOR = _cfg_str("couleurs", "TEXT_COLOR", "#17130c")
 root.configure(background=BACKGROUND_COLOR)
 
 stop_event = threading.Event()
@@ -97,8 +155,13 @@ if ticking_enabled:
     try:
         _tick_raw_samples, _tick_wav_params = load_pcm16_mono(TICK_WAV_PATH)
         _tock_raw_samples, _tock_wav_params = load_pcm16_mono(TOCK_WAV_PATH)
-    except (wave.Error, OSError):
-        ticking_enabled = False
+    except (wave.Error, OSError, struct.error):
+        # Les fichiers existent mais ne sont pas convertibles par notre réglage
+        # de volume : on les jouera directement au lieu de désactiver le tic-tac.
+        _tick_raw_samples = []
+        _tock_raw_samples = []
+        _tick_wav_params = None
+        _tock_wav_params = None
 
 
 def apply_tick_volume(volume_percent: float) -> None:
@@ -106,6 +169,17 @@ def apply_tick_volume(volume_percent: float) -> None:
     global current_tick_path, current_tock_path, _volume_generation
 
     if not ticking_enabled:
+        return
+
+    # Si le WAV n'est pas au format attendu, on conserve les originaux.
+    if (
+        not _tick_raw_samples
+        or not _tock_raw_samples
+        or _tick_wav_params is None
+        or _tock_wav_params is None
+    ):
+        current_tick_path = TICK_WAV_PATH
+        current_tock_path = TOCK_WAV_PATH
         return
 
     factor = max(0.0, min(1.0, volume_percent / 100))
@@ -129,17 +203,33 @@ def apply_tick_volume(volume_percent: float) -> None:
     old_tick_path, old_tock_path = current_tick_path, current_tock_path
     current_tick_path, current_tock_path = new_tick_path, new_tock_path
 
-    # Nettoyage au mieux : si l'ancien fichier est encore en cours de lecture,
-    # on laisse tomber sans bruit, le système le nettoiera au redémarrage.
+    # Ne supprimer que d'anciennes COPIES temporaires générées par DTLclock.
+    # Les fichiers source tick.wav et tock.wav ne doivent jamais être touchés.
+    temp_dir = Path(tempfile.gettempdir()).resolve()
+    protected_paths = {
+        TICK_WAV_PATH.resolve(),
+        TOCK_WAV_PATH.resolve(),
+    }
+
     for old_path in (old_tick_path, old_tock_path):
-        if old_path is not None:
-            try:
-                old_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        if old_path is None:
+            continue
+
+        try:
+            resolved_old_path = old_path.resolve()
+            is_generated_copy = (
+                resolved_old_path.parent == temp_dir
+                and resolved_old_path.name.startswith(("dtlclock_tick_", "dtlclock_tock_"))
+            )
+            if is_generated_copy and resolved_old_path not in protected_paths:
+                resolved_old_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 if ticking_enabled:
+    current_tick_path = TICK_WAV_PATH
+    current_tock_path = TOCK_WAV_PATH
     apply_tick_volume(tick_volume_percent)
 
 
@@ -283,12 +373,19 @@ def play_tick_sound(wav_path: Path) -> None:
 
 
 def fire_tick() -> None:
-    """Déclenche un tic (ou un tac, en alternance) et programme le suivant."""
-    global _next_tick_index
+    """Fait avancer l'échappement, la trotteuse et le tic-tac au même instant."""
+    global _next_tick_index, displayed_clock_time
+
+    # Le mécanisme continue de battre même lorsque le son du tic-tac est coupé.
+    # La trotteuse avance donc d'un cran exactement à chaque extrémité du balancier.
+    if pendulum_running:
+        displayed_clock_time = datetime.now().replace(microsecond=0)
+        update_clock_hands(displayed_clock_time)
 
     if ticking_active and tick_volume_percent > 0 and current_tick_path is not None:
         wav_path = current_tick_path if _next_tick_index % 2 == 0 else current_tock_path
         threading.Thread(target=play_tick_sound, args=(wav_path,), daemon=True).start()
+
     _next_tick_index += 1
     schedule_next_tick()
 
@@ -393,16 +490,17 @@ def stop_carillon_monitor() -> None:
 
 
 def start_clock() -> None:
-    """Relance l'horloge : balancier et tic-tac."""
-    global pendulum_running, pendulum_start_time
+    """Relance l'horloge : balancier, échappement et tic-tac."""
+    global pendulum_running, pendulum_start_time, displayed_clock_time
 
     if not pendulum_running:
         pendulum_start_time = time.perf_counter()
+        displayed_clock_time = datetime.now().replace(microsecond=0)
         pendulum_running = True
         clock_start_button.configure(state="disabled")
         clock_stop_button.configure(state="normal")
 
-    update_clock_hands()
+    update_clock_hands(displayed_clock_time)
     start_ticking()
 
 
@@ -418,13 +516,20 @@ def stop_clock() -> None:
 
 
 def start_ticking() -> None:
-    """Active le son du tic-tac."""
-    global ticking_active
+    """Active le son du tic-tac sans produire de battement artificiel."""
+    global ticking_active, _next_tick_index, pendulum_start_time
 
     if not ticking_enabled:
+        messagebox.showwarning(
+            "DTLclock",
+            "Impossible d'activer le tic-tac.\n\n"
+            f"Fichier recherché :\n{TICK_WAV_PATH}\n{TOCK_WAV_PATH}",
+        )
         return
 
     ticking_active = True
+    _next_tick_index = 0
+    pendulum_start_time = time.perf_counter()
     tick_start_button.configure(state="disabled")
     tick_stop_button.configure(state="normal")
 
@@ -461,6 +566,59 @@ except (FileNotFoundError, OSError) as error:
     root.destroy()
     raise SystemExit(1) from error
 
+
+def get_primary_work_area() -> tuple[int, int, int, int]:
+    """Retourne la zone utile de l'écran principal, hors barre des tâches."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            work_area = wintypes.RECT()
+            spi_getworkarea = 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(
+                spi_getworkarea, 0, ctypes.byref(work_area), 0
+            ):
+                return (
+                    work_area.left,
+                    work_area.top,
+                    work_area.right,
+                    work_area.bottom,
+                )
+        except (AttributeError, OSError):
+            pass
+
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
+def set_initial_full_height_geometry() -> None:
+    """Dimensionne DTLclock presque sur toute la hauteur de l'écran principal."""
+    work_left, work_top, work_right, work_bottom = get_primary_work_area()
+    work_width = max(1, work_right - work_left)
+    work_height = max(1, work_bottom - work_top)
+
+    # Une petite marge évite que la bordure de fenêtre touche les bords.
+    target_height = max(760, round(work_height * 0.97))
+    target_width = max(
+        420,
+        round(target_height * source_image.width / source_image.height),
+    )
+
+    # Sur un écran très étroit, on conserve les proportions de l'image.
+    if target_width > work_width:
+        target_width = max(420, round(work_width * 0.97))
+        target_height = max(
+            760,
+            round(target_width * source_image.height / source_image.width),
+        )
+
+    x = work_left + max(0, (work_width - target_width) // 2)
+    y = work_top + max(0, (work_height - target_height) // 2)
+    root.geometry(f"{target_width}x{target_height}+{x}+{y}")
+
+
+set_initial_full_height_geometry()
+
 canvas = tk.Canvas(
     root,
     background=BACKGROUND_COLOR,
@@ -470,37 +628,45 @@ canvas.place(x=0, y=0, relwidth=1, relheight=1)
 background_item = canvas.create_image(250, 450, image=photo)
 
 # Coordonnées exprimées dans l'image source 1080 × 1920.
-PENDULUM_PIVOT_X = 550
-PENDULUM_PIVOT_Y = 950
-PENDULUM_ROD_LENGTH = 395
-PENDULUM_BOB_RADIUS = 74
-PENDULUM_MAX_ANGLE = 7
-PENDULUM_PERIOD_SECONDS = 2.0
-PENDULUM_FRAME_DELAY_MS = 16
+PENDULUM_PIVOT_X = _cfg_int("balancier", "PENDULUM_PIVOT_X", 550)
+PENDULUM_PIVOT_Y = _cfg_int("balancier", "PENDULUM_PIVOT_Y", 950)
+PENDULUM_ROD_LENGTH = _cfg_int("balancier", "PENDULUM_ROD_LENGTH", 395)
+PENDULUM_BOB_RADIUS = _cfg_int("balancier", "PENDULUM_BOB_RADIUS", 74)
+PENDULUM_MAX_ANGLE = _cfg_int("balancier", "PENDULUM_MAX_ANGLE", 7)
+PENDULUM_PERIOD_SECONDS = _cfg_float("balancier", "PENDULUM_PERIOD_SECONDS", 2.0)
+PENDULUM_FRAME_DELAY_MS = _cfg_int("balancier", "PENDULUM_FRAME_DELAY_MS", 16)
 # Écartement latéral des deux branches parallèles fines de part et d'autre
 # de la tige centrale (motif "gridiron"), en coordonnées de l'image source.
-PENDULUM_SIDE_ROD_OFFSET = 9
+PENDULUM_SIDE_ROD_OFFSET = _cfg_int("balancier", "PENDULUM_SIDE_ROD_OFFSET", 9)
 # Position (fraction de la longueur visible de la tige, 0 = pivot,
 # 1 = bord de la sphère) des petites traverses décoratives reliant les
 # deux branches latérales.
-PENDULUM_CROSSBAR_FRACTIONS = (0.28, 0.55, 0.82)
+PENDULUM_CROSSBAR_FRACTIONS = _cfg_float_tuple(
+    "balancier", "PENDULUM_CROSSBAR_FRACTIONS", (0.28, 0.55, 0.82)
+)
 
 # Position du centre du cadran dans l'image source 1080 × 1920.
-DIAL_CENTER_X = 550
-DIAL_CENTER_Y = 540
-HOUR_HAND_LENGTH = 86
-MINUTE_HAND_LENGTH = 124
-SECOND_HAND_LENGTH = 132
-CLOCK_REFRESH_MS = 200
+DIAL_CENTER_X = _cfg_int("cadran", "DIAL_CENTER_X", 550)
+DIAL_CENTER_Y = _cfg_int("cadran", "DIAL_CENTER_Y", 540)
+HOUR_HAND_LENGTH = _cfg_int("cadran", "HOUR_HAND_LENGTH", 86)
+MINUTE_HAND_LENGTH = _cfg_int("cadran", "MINUTE_HAND_LENGTH", 124)
+SECOND_HAND_LENGTH = _cfg_int("cadran", "SECOND_HAND_LENGTH", 132)
+CLOCK_REFRESH_MS = _cfg_int("cadran", "CLOCK_REFRESH_MS", 200)
 
-# Petite porte secrète du socle, exprimée dans le repère 1080 x 1920.
-DOOR_LEFT = 650
-DOOR_TOP = 1490
-DOOR_RIGHT = 965
-DOOR_BOTTOM = 1840
-DOOR_KNOB_X = 925
-DOOR_KNOB_Y = 1665
-DOOR_ANIMATION_STEPS = 8
+# Bouton caché dans la rose centrale du socle.
+ROSE_BUTTON_X = _cfg_int("bouton_rose", "ROSE_BUTTON_X", 550)
+ROSE_BUTTON_Y = _cfg_int("bouton_rose", "ROSE_BUTTON_Y", 1655)
+ROSE_BUTTON_RADIUS = _cfg_int("bouton_rose", "ROSE_BUTTON_RADIUS", 14)
+
+# Compartiment central du socle, exprimé dans le repère 1080 × 1920.
+COMPARTMENT_LEFT = _cfg_int("compartiment", "COMPARTMENT_LEFT", 335)
+COMPARTMENT_TOP = _cfg_int("compartiment", "COMPARTMENT_TOP", 1460)
+COMPARTMENT_RIGHT = _cfg_int("compartiment", "COMPARTMENT_RIGHT", 790)
+COMPARTMENT_BOTTOM = _cfg_int("compartiment", "COMPARTMENT_BOTTOM", 1815)
+
+# Le tableau occupe une fraction du compartiment et reste toujours centré.
+SCHEDULE_WIDTH_RATIO = _cfg_float("tableau_horaires", "SCHEDULE_WIDTH_RATIO", 0.68)
+SCHEDULE_HEIGHT_RATIO = _cfg_float("tableau_horaires", "SCHEDULE_HEIGHT_RATIO", 0.52)
 
 # Profils des aiguilles heure/minute façon "spatule Louis XV" : un contre-poids
 # derrière le pivot, un renflement près du moyeu, puis une lame effilée qui se
@@ -611,9 +777,12 @@ image_offset_x = 0.0
 image_offset_y = (900 - 889) / 2
 current_pendulum_angle = 0.0
 pendulum_start_time = time.perf_counter()
-door_open = False
-door_animating = False
-door_animation_step = 0
+
+# Heure effectivement affichée par le mécanisme. Elle ne progresse qu'à chaque
+# échappement du balancier, au même instant que le tic ou le tac.
+displayed_clock_time = datetime.now().replace(microsecond=0)
+
+schedule_open = False
 
 
 def update_pendulum(angle_degrees: float) -> None:
@@ -776,8 +945,8 @@ def hand_polygon_points(
 
 
 def update_clock_hands(now: datetime | None = None) -> None:
-    """Affiche l'heure courante sur le cadran analogique."""
-    current = datetime.now() if now is None else now
+    """Affiche l'heure transmise par le mécanisme de l'horloge."""
+    current = displayed_clock_time if now is None else now
     center_x = image_offset_x + DIAL_CENTER_X * image_scale
     center_y = image_offset_y + DIAL_CENTER_Y * image_scale
 
@@ -785,11 +954,10 @@ def update_clock_hands(now: datetime | None = None) -> None:
         30 * (current.hour % 12) + 0.5 * current.minute + current.second / 120 - 90
     )
     minute_angle = math.radians(
-        6 * current.minute + 0.1 * current.second + current.microsecond / 10_000_000 - 90
+        6 * current.minute + 0.1 * current.second - 90
     )
-    second_angle = math.radians(
-        6 * current.second + current.microsecond / 166_666.6667 - 90
-    )
+    # Trotteuse mécanique : un saut net de 6 degrés par échappement.
+    second_angle = math.radians(6 * current.second - 90)
 
     def endpoint(length: float, angle: float) -> tuple[float, float]:
         scaled_length = length * image_scale
@@ -865,98 +1033,67 @@ def update_clock_hands(now: datetime | None = None) -> None:
 
 
 def animate_clock_hands() -> None:
-    """Actualise les aiguilles uniquement lorsque l'horloge fonctionne."""
-    if pendulum_running:
-        update_clock_hands()
-
-    root.after(CLOCK_REFRESH_MS, animate_clock_hands)
+    """Dessine l'état initial ; les battements suivants sont pilotés par fire_tick()."""
+    update_clock_hands()
 
 
-def position_secret_door() -> None:
-    """Replace la porte, son bouton et le tableau intérieur après redimensionnement."""
-    left = image_offset_x + DOOR_LEFT * image_scale
-    top = image_offset_y + DOOR_TOP * image_scale
-    right = image_offset_x + DOOR_RIGHT * image_scale
-    bottom = image_offset_y + DOOR_BOTTOM * image_scale
+def position_schedule_panel() -> None:
+    """Place le bouton sur la rose et centre le tableau dans le socle."""
+    button_x = image_offset_x + ROSE_BUTTON_X * image_scale
+    button_y = image_offset_y + ROSE_BUTTON_Y * image_scale
+    button_radius = max(4.0, ROSE_BUTTON_RADIUS * image_scale)
 
-    # Lors de l'ouverture, la porte se replie visuellement vers sa charnière gauche.
-    progress = door_animation_step / DOOR_ANIMATION_STEPS
-    visible_right = right - (right - left) * progress
-    canvas.coords(secret_door, left, top, visible_right, bottom)
-    canvas.itemconfigure(secret_door, width=max(1, round(3 * image_scale)))
-
-    knob_x = image_offset_x + DOOR_KNOB_X * image_scale
-    knob_y = image_offset_y + DOOR_KNOB_Y * image_scale
-    knob_x = knob_x - (knob_x - left) * progress
-    knob_radius = max(3.0, 10 * image_scale)
     canvas.coords(
-        secret_door_knob,
-        knob_x - knob_radius,
-        knob_y - knob_radius,
-        knob_x + knob_radius,
-        knob_y + knob_radius,
+        rose_button,
+        button_x - button_radius,
+        button_y - button_radius,
+        button_x + button_radius,
+        button_y + button_radius,
     )
-    canvas.itemconfigure(secret_door_knob, width=max(1, round(2 * image_scale)))
-
-    panel_width = max(235, round((DOOR_RIGHT - DOOR_LEFT) * image_scale))
-    panel_height = max(270, round((DOOR_BOTTOM - DOOR_TOP) * image_scale))
-    panel_x = min(left, max(5.0, root.winfo_width() - panel_width - 5.0))
-    schedule_panel.place(
-        x=panel_x,
-        y=top,
-        width=panel_width,
-        height=panel_height,
+    canvas.itemconfigure(
+        rose_button,
+        width=max(1, round(2 * image_scale)),
+        state="hidden" if schedule_open else "normal",
     )
 
+    compartment_left = image_offset_x + COMPARTMENT_LEFT * image_scale
+    compartment_top = image_offset_y + COMPARTMENT_TOP * image_scale
+    compartment_right = image_offset_x + COMPARTMENT_RIGHT * image_scale
+    compartment_bottom = image_offset_y + COMPARTMENT_BOTTOM * image_scale
 
-def finish_door_animation(opening: bool) -> None:
-    """Termine l'animation et révèle ou masque le tableau des 24 heures."""
-    global door_open, door_animating
+    compartment_width = compartment_right - compartment_left
+    compartment_height = compartment_bottom - compartment_top
 
-    door_open = opening
-    door_animating = False
-    if opening:
-        schedule_panel.lift()
-        schedule_panel.place_configure()
-    else:
-        schedule_panel.lower()
-        schedule_panel.place_forget()
-    position_secret_door()
+    panel_width = max(1, round(compartment_width * SCHEDULE_WIDTH_RATIO))
+    panel_height = max(1, round(compartment_height * SCHEDULE_HEIGHT_RATIO))
 
+    panel_x = compartment_left + (compartment_width - panel_width) / 2
+    # Décalage volontairement visible vers le bas : 9 % de la hauteur du
+    # compartiment, soit environ 25 à 30 pixels à la taille d'affichage actuelle.
+    panel_y = (
+        compartment_top
+        + (compartment_height - panel_height) / 2
+        + compartment_height * 0.09
+    )
 
-def animate_secret_door(opening: bool) -> None:
-    """Anime discrètement l'ouverture ou la fermeture de la porte du socle."""
-    global door_animation_step
-
-    if opening:
-        door_animation_step += 1
-    else:
-        door_animation_step -= 1
-
-    door_animation_step = max(0, min(DOOR_ANIMATION_STEPS, door_animation_step))
-    position_secret_door()
-
-    target = DOOR_ANIMATION_STEPS if opening else 0
-    if door_animation_step == target:
-        finish_door_animation(opening)
-    else:
-        root.after(22, lambda: animate_secret_door(opening))
-
-
-def toggle_secret_door(_event: tk.Event[tk.Misc] | None = None) -> None:
-    """Ouvre ou referme la petite porte secrète du socle."""
-    global door_animating
-
-    if door_animating:
-        return
-    door_animating = True
-    if not door_open:
+    if schedule_open:
         schedule_panel.place(
-            x=image_offset_x + DOOR_LEFT * image_scale,
-            y=image_offset_y + DOOR_TOP * image_scale,
+            x=round(panel_x),
+            y=round(panel_y),
+            width=panel_width,
+            height=panel_height,
         )
-        schedule_panel.lower()
-    animate_secret_door(not door_open)
+        schedule_panel.lift()
+    else:
+        schedule_panel.place_forget()
+
+
+def toggle_schedule_panel(_event: tk.Event[tk.Misc] | None = None) -> None:
+    """Affiche ou masque le tableau des heures silencieuses."""
+    global schedule_open
+
+    schedule_open = not schedule_open
+    position_schedule_panel()
 
 
 def set_all_silent_hours(value: bool) -> None:
@@ -1002,7 +1139,7 @@ def resize_clock_image() -> None:
     )
     update_pendulum(current_pendulum_angle)
     update_clock_hands()
-    position_secret_door()
+    position_schedule_panel()
 
     interface_scale = max(
         0.65,
@@ -1246,19 +1383,10 @@ status_label = tk.Label(
 )
 status_label.pack(anchor="w", fill="x", pady=(1, 0))
 
-# --- Porte secrète du socle -----------------------------------------------
-# La porte est volontairement presque invisible : un simple joint sombre et
-# un petit bouton doré. Le bouton et la porte entière sont cliquables.
-secret_door = canvas.create_rectangle(
-    0,
-    0,
-    0,
-    0,
-    fill="",
-    outline="#4b2b18",
-    width=2,
-)
-secret_door_knob = canvas.create_oval(
+# --- Tableau des heures silencieuses ---------------------------------------
+# Fermé : seul un petit bouton doré est posé au centre de la rose du socle.
+# Ouvert : le tableau apparaît directement dans le meuble, sans porte animée.
+rose_button = canvas.create_oval(
     0,
     0,
     0,
@@ -1267,41 +1395,40 @@ secret_door_knob = canvas.create_oval(
     outline="#6d4a16",
     width=2,
 )
-canvas.tag_bind(secret_door, "<Button-1>", toggle_secret_door)
-canvas.tag_bind(secret_door_knob, "<Button-1>", toggle_secret_door)
-canvas.tag_bind(secret_door, "<Enter>", lambda _event: canvas.configure(cursor="hand2"))
-canvas.tag_bind(secret_door_knob, "<Enter>", lambda _event: canvas.configure(cursor="hand2"))
-canvas.tag_bind(secret_door, "<Leave>", lambda _event: canvas.configure(cursor=""))
-canvas.tag_bind(secret_door_knob, "<Leave>", lambda _event: canvas.configure(cursor=""))
+canvas.tag_bind(rose_button, "<Button-1>", toggle_schedule_panel)
+canvas.tag_bind(
+    rose_button,
+    "<Enter>",
+    lambda _event: canvas.configure(cursor="hand2"),
+)
+canvas.tag_bind(
+    rose_button,
+    "<Leave>",
+    lambda _event: canvas.configure(cursor=""),
+)
+
+PANEL_BACKGROUND = _cfg_str("couleurs", "PANEL_BACKGROUND", "#eadca5")
 
 schedule_panel = tk.Frame(
     root,
-    background="#eadca5",
-    borderwidth=2,
-    relief="ridge",
+    background=PANEL_BACKGROUND,
+    borderwidth=0,
+    relief="flat",
 )
-
-panel_title = tk.Label(
-    schedule_panel,
-    text="Silence du carillon",
-    font=heading_font,
-    foreground=TEXT_COLOR,
-    background="#eadca5",
-)
-panel_title.pack(pady=(5, 2))
 
 panel_hint = tk.Label(
     schedule_panel,
     text="Cocher les heures silencieuses",
     font=tkfont.Font(root=root, family="Verdana", size=9, slant="italic"),
     foreground="#5b5032",
-    background="#eadca5",
+    background=PANEL_BACKGROUND,
 )
-panel_hint.pack(pady=(0, 3))
+panel_hint.pack(pady=(1, 1))
 
-hours_grid = tk.Frame(schedule_panel, background="#eadca5")
-hours_grid.pack(expand=True)
+hours_grid = tk.Frame(schedule_panel, background=PANEL_BACKGROUND)
+hours_grid.pack(expand=True, pady=(0, 1))
 silent_hour_vars: list[tk.BooleanVar] = []
+
 for hour in range(24):
     variable = tk.BooleanVar(value=False)
     silent_hour_vars.append(variable)
@@ -1312,19 +1439,21 @@ for hour in range(24):
         command=update_silent_hours,
         font=tkfont.Font(root=root, family="Verdana", size=9),
         foreground=TEXT_COLOR,
-        background="#eadca5",
-        activebackground="#eadca5",
+        background=PANEL_BACKGROUND,
+        activebackground=PANEL_BACKGROUND,
         activeforeground=TEXT_COLOR,
-        selectcolor="#eadca5",
+        selectcolor=PANEL_BACKGROUND,
         borderwidth=0,
         highlightthickness=0,
-        padx=2,
+        padx=1,
         pady=0,
+        cursor="hand2",
     )
-    checkbox.grid(row=hour % 6, column=hour // 6, sticky="w", padx=2)
+    checkbox.grid(row=hour % 6, column=hour // 6, sticky="w", padx=1)
 
-panel_buttons = tk.Frame(schedule_panel, background="#eadca5")
-panel_buttons.pack(pady=(2, 5))
+panel_buttons = tk.Frame(schedule_panel, background=PANEL_BACKGROUND)
+panel_buttons.pack(pady=(1, 2))
+
 for label, value in (("Tout cocher", True), ("Tout décocher", False)):
     button = tk.Button(
         panel_buttons,
@@ -1332,36 +1461,49 @@ for label, value in (("Tout cocher", True), ("Tout décocher", False)):
         command=lambda selected=value: set_all_silent_hours(selected),
         font=tkfont.Font(root=root, family="Verdana", size=8),
         foreground=TEXT_COLOR,
-        background="#eadca5",
+        background=PANEL_BACKGROUND,
         activebackground="#d9c780",
         borderwidth=1,
         relief="groove",
-        padx=4,
-        pady=1,
+        padx=3,
+        pady=0,
+        cursor="hand2",
     )
-    button.pack(side="left", padx=2)
+    button.pack(side="left", padx=1)
 
 close_panel_button = tk.Button(
     panel_buttons,
-    text="Refermer",
-    command=toggle_secret_door,
+    text="Fermer",
+    command=toggle_schedule_panel,
     font=tkfont.Font(root=root, family="Verdana", size=8),
     foreground=TEXT_COLOR,
-    background="#eadca5",
+    background=PANEL_BACKGROUND,
     activebackground="#d9c780",
     borderwidth=1,
     relief="groove",
-    padx=4,
-    pady=1,
+    padx=3,
+    pady=0,
+    cursor="hand2",
 )
-close_panel_button.pack(side="left", padx=2)
+close_panel_button.pack(side="left", padx=1)
+
 schedule_panel.place_forget()
 
 root.protocol("WM_DELETE_WINDOW", close)
 animate_pendulum()
 animate_clock_hands()
 if ticking_enabled:
-    schedule_next_tick()
+    # Active le tic-tac après le démarrage de Tkinter, puis laisse le premier
+    # battement se produire naturellement à l'extrémité suivante du balancier.
+    root.after(250, start_ticking)
+    root.after(260, schedule_next_tick)
+else:
+    root.after(
+        250,
+        lambda: status.set(
+            f"Tic-tac indisponible : {TICK_WAV_PATH.name}/{TOCK_WAV_PATH.name}"
+        ),
+    )
 start_carillon_monitor()
 
 if __name__ == "__main__":

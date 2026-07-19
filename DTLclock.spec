@@ -5,7 +5,7 @@ a = Analysis(
     ['DTLclock.py'],
     pathex=[],
     binaries=[],
-    datas=[('horloge.png', '.'), ('balancier.png', '.'), ('bell1700.wav', '.'), ('bell1800.wav', '.'), ('tick.wav', '.'), ('tock.wav', '.')],
+    datas=[('DTLclock.ini', '.'),('horloge.png', '.'), ('balancier.png', '.'), ('bell1700.wav', '.'), ('bell1800.wav', '.'), ('tick.wav', '.'), ('tock.wav', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

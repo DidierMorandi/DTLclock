@@ -1,5 +1,7 @@
 /__pycache__/
 /logs/
+/archives/
+/.dtl_version
 
 /DTLclock_good_1.py
 /DTLclock_good_2.py
